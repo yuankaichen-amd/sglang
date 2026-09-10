@@ -712,11 +712,7 @@ class DeepseekV2MoE(nn.Module):
                     use_grouped_topk=False,
                     scoring_func=config.scoring_func,
                     is_fp4_experts=getattr(quant_config, "is_fp4_experts", False),
-                    apply_routed_scaling_factor_on_output=(
-                        True
-                        if _use_aiter
-                        else self.experts.should_fuse_routed_scaling_factor_in_topk
-                    ),
+                    apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
                 )
             self.topk = TopK(**topk_kwargs)
 
@@ -1019,10 +1015,12 @@ class DeepseekV2MoE(nn.Module):
         else:
             final_hidden_states = self.experts(hidden_states, topk_output)
         if (
-            not _is_cuda
-            and not _is_musa
-            and not _use_aiter
-            or isinstance(self.experts.quant_method, KTEPWrapperMethod)
+            isinstance(self.experts.quant_method, KTEPWrapperMethod)
+            or (
+                not _is_cuda
+                and not _is_musa
+                and not self.experts.should_fuse_routed_scaling_factor_in_topk
+            )
         ):
             final_hidden_states *= self.routed_scaling_factor
 
@@ -1165,13 +1163,15 @@ class DeepseekV2MoE(nn.Module):
                 topk_output,
             )
         if (
-            not _is_cuda
-            and not _is_musa
-            and not _is_xpu
-            and not _use_aiter
-            or isinstance(self.experts.quant_method, KTEPWrapperMethod)
+            isinstance(self.experts.quant_method, KTEPWrapperMethod)
+            or (
+                not _is_cuda
+                and not _is_musa
+                and not _is_xpu
+                and not self.experts.should_fuse_routed_scaling_factor_in_topk
+            )
         ):
-            # fused in biased_grouped_topk so we can skip here
+            # skip only when rsf is already folded into topk weights
             final_hidden_states *= self.routed_scaling_factor
 
         if (
@@ -1481,17 +1481,15 @@ class DeepseekV2MoE(nn.Module):
 
         if shared_output is not None:
             x = shared_output
-            # aiter moe call will handle routed_scaling_factor in the function
-            # so add _use_aiter condition to eliminate to use self.routed_scaling_factor in add_ call
-            if self.experts.should_fuse_routed_scaling_factor_in_topk or _use_aiter:
+            # aiter fused_moe does not apply routed_scaling_factor; skip this
+            # multiply only when topk already folded it in.
+            if self.experts.should_fuse_routed_scaling_factor_in_topk:
                 x.add_(final_hidden_states)
             else:
                 x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
             final_hidden_states = x
         else:
-            if not (
-                self.experts.should_fuse_routed_scaling_factor_in_topk or _use_aiter
-            ):
+            if not self.experts.should_fuse_routed_scaling_factor_in_topk:
                 final_hidden_states *= self.routed_scaling_factor
 
         return final_hidden_states
@@ -1717,13 +1715,12 @@ class DeepseekV2MoE(nn.Module):
 
         if (shared_output := state.pop("shared_output")) is not None:
             x = shared_output
-            if _use_aiter:
+            if self.experts.should_fuse_routed_scaling_factor_in_topk:
                 x.add_(final_hidden_states)
             else:
                 x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
             final_hidden_states = x
-        elif _use_aiter:
-            # fused in aiter_biased_grouped_topk so we can skip here
+        elif self.experts.should_fuse_routed_scaling_factor_in_topk:
             pass
         else:
             final_hidden_states *= self.routed_scaling_factor

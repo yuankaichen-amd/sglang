@@ -1367,7 +1367,14 @@ def biased_topk_jit_kernel_impl(
             gating_output,
             correction_bias,
             renormalize,
-            routed_scaling_factor,
+            # Kernel always multiplies this scale. Pass 1.0 unless the caller
+            # asked to fold routed_scaling_factor into the topk weights.
+            (
+                routed_scaling_factor
+                if apply_routed_scaling_factor_on_output
+                and routed_scaling_factor is not None
+                else 1.0
+            ),
             score_func="sqrtsoftplus",
         )
 
