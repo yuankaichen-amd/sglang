@@ -1190,6 +1190,49 @@ def _triton_sparse_mla_fwd_splitk(
 # ---------------------------------------------------------------------------
 
 
+_NOPE_FALLBACK_ROWS_PER_CHUNK = 128
+
+
+def _torch_sparse_mla_fwd_nope(
+    q_nope: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int,
+    topk_length: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Sparse MLA for models without a RoPE tail (e.g. GLM-5 DSA).
+
+    The Triton kernels build ``tl.arange(0, D_TAIL)`` and cannot be compiled
+    with D_TAIL == 0, so NoPE inputs take this chunked torch path instead.
+    """
+    assert q_nope.dtype == torch.bfloat16 and kv.dtype == torch.bfloat16, (
+        "NoPE sparse MLA fallback only supports bf16 q and kv, got "
+        f"{q_nope.dtype} and {kv.dtype}"
+    )
+    seq, num_heads, _ = q_nope.shape
+    kv_flat = kv.view(kv.shape[0], kv.shape[-1])
+    idx = indices.reshape(seq, -1).long()
+    valid = idx >= 0
+    if topk_length is not None:
+        cols = torch.arange(idx.shape[1], device=idx.device)
+        valid &= cols[None, :] < topk_length.reshape(-1, 1).to(idx.device)
+    out = torch.empty(
+        1, seq, num_heads, d_v, device=q_nope.device, dtype=torch.bfloat16
+    )
+    for start in range(0, seq, _NOPE_FALLBACK_ROWS_PER_CHUNK):
+        rows = slice(start, start + _NOPE_FALLBACK_ROWS_PER_CHUNK)
+        kv_sel = kv_flat[idx[rows].clamp(min=0)].float()
+        scores = torch.einsum("chd,ckd->chk", q_nope[rows].float(), kv_sel)
+        scores = (scores * sm_scale).masked_fill(~valid[rows, None, :], float("-inf"))
+        # rows with no valid index softmax to NaN; emit zeros like the kernels do
+        probs = torch.softmax(scores, dim=-1).nan_to_num_(0.0)
+        out[0, rows] = torch.einsum("chk,ckd->chd", probs, kv_sel[..., :d_v]).to(
+            torch.bfloat16
+        )
+    return out
+
+
 def triton_sparse_mla_fwd(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
@@ -1209,6 +1252,10 @@ def triton_sparse_mla_fwd(
 
     Returns [1, seq, H, d_v] bf16 to match tilelang_sparse_fwd.
     """
+    if q_rope is None or q_rope.shape[-1] == 0:
+        return _torch_sparse_mla_fwd_nope(
+            q_nope, kv, indices, sm_scale, d_v, topk_length=topk_length
+        )
     seq = q_nope.shape[0]
     H = q_nope.shape[1]
     num_cu = _cu_count(q_nope.device)

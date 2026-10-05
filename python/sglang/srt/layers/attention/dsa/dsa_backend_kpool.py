@@ -13,6 +13,9 @@ from sglang.srt.layers.attention.dsa.kpool_plan import (
     update_kpool_write_plan,
     update_pooled_paged_mqa_metadata,
 )
+from sglang.srt.utils import is_hip
+
+_is_hip = is_hip()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
@@ -42,12 +45,15 @@ class DeepseekSparseAttnBackendKPoolMixin:
             topk_indices is None
             or self.dsa_index_kpool <= 1
             or dsa_impl in ("fa3", "tilelang", "trtllm")
+            # triton_sparse_mla_fwd bounds by indices.shape[-1] and skips -1,
+            # so the widened tail indices work; validated on ROCm only
+            or (_is_hip and dsa_impl == "triton")
         ):
             return
         raise NotImplementedError(
             "index_kpool > 1 appends tail tokens to topk_indices and is "
             f"currently only supported by the FA3/TileLang/TRTLLM DSA {phase} "
-            "backend."
+            "backend (or Triton on ROCm)."
         )
 
     def _resolve_kpool_tail_backend(
