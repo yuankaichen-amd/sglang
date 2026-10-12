@@ -78,6 +78,8 @@ from typing import (
 
 import msgspec
 import numpy as np
+import os  # [r3-keep-routing-patch]
+
 import torch
 
 from sglang.srt.beam_search.batch_tail import (
@@ -2236,6 +2238,30 @@ def set_mamba_track_indices_from_reqs(
     )
 
 
+_R3_KEEP_ROUTING = os.environ.get("SGLANG_R3_KEEP_ROUTING_ON_RETRACT", "0") == "1"  # [r3-keep-routing-patch]
+
+
+def _r3_keep_routing_before_release(req: "Req", req_to_token_pool) -> None:  # [r3-keep-routing-patch]
+    """Copy the captured routing of the request's computed positions to host before its KV is freed."""
+    if not (_R3_KEEP_ROUTING and req.return_routed_experts and req.kv.req_pool_idx is not None):
+        return
+    from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
+
+    capturer = get_global_experts_capturer()
+    if capturer is None:
+        return
+    # Positions [0, n) have been forwarded: the last sampled token has no KV yet, and a
+    # retracted chunked prefill has only computed up to kv_committed_len.
+    n = min(len(req.origin_input_ids) + len(req.output_ids) - 1, req.kv.kv_committed_len)
+    kept = getattr(req, "r3_kept_routed_experts", None)
+    if n <= (0 if kept is None else kept.shape[0]):
+        return
+    rows = capturer.get_topk(req_pool_idx=req.kv.req_pool_idx, seqlen=n + 1, req_to_token_pool=req_to_token_pool)
+    if kept is not None:
+        rows[: kept.shape[0]] = kept
+    req.r3_kept_routed_experts = rows
+
+
 def release_req(
     *,
     req: Req,
@@ -2264,6 +2290,7 @@ def release_req(
             token_to_kv_pool_allocator,
             get_disagg().disaggregation_decode_retraction_backup,
         )
+    _r3_keep_routing_before_release(req, req_to_token_pool)  # [r3-keep-routing-patch]
     # TODO (csy): for preempted requests, we may want to insert into the tree
     release_kv_cache(req, tree_cache, is_insert=False)
     # NOTE(lsyin): we should use the newly evictable memory instantly.
