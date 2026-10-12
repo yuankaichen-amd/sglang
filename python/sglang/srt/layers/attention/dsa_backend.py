@@ -3022,6 +3022,11 @@ class DeepseekSparseAttnBackend(
         from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
             triton_sparse_mla_decode_splitk,
         )
+        if torch.version.hip is not None and (q_rope is None or q_rope.shape[-1] == 0):  # [rocm-kpool-patch-decode-nope]
+            from sglang.kernels.ops.attention.dsa.triton_sparse_mla import triton_sparse_mla_fwd
+
+            return triton_sparse_mla_fwd(q_nope=q_nope, q_rope=q_rope, kv=kv_cache,
+                indices=page_table_1.unsqueeze(1), sm_scale=sm_scale, d_v=v_head_dim)
 
         return triton_sparse_mla_decode_splitk(
             q_nope=q_nope,

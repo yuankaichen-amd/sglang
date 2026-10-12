@@ -1073,6 +1073,25 @@ def _triton_sparse_mla_fwd_splitk(
 # ---------------------------------------------------------------------------
 
 
+def _rocm_nope_sparse_mla_fwd(q_nope, kv, indices, sm_scale, d_v):  # [rocm-kpool-patch-nope]
+    # Triton kernels need D_TAIL > 0 (tl.arange(0, D_TAIL)); GLM-5 DSA is NoPE.
+    assert kv.dtype == torch.bfloat16 and q_nope.dtype == torch.bfloat16
+    seq, H, _ = q_nope.shape
+    kv2 = kv.view(kv.shape[0], kv.shape[-1])
+    idx = indices.reshape(seq, -1).long()
+    out = torch.empty(1, seq, H, d_v, device=q_nope.device, dtype=torch.bfloat16)
+    for s in range(0, seq, 128):
+        e = min(seq, s + 128)
+        ic = idx[s:e]
+        valid = ic >= 0
+        kvg = kv2[ic.clamp(min=0)].float()
+        sc = torch.einsum("chd,ckd->chk", q_nope[s:e].float(), kvg) * sm_scale
+        sc = sc.masked_fill(~valid[:, None, :], float("-inf"))
+        p = torch.softmax(sc, dim=-1).nan_to_num_(0.0)
+        out[0, s:e] = torch.einsum("chk,ckd->chd", p, kvg[..., :d_v]).to(torch.bfloat16)
+    return out
+
+
 def triton_sparse_mla_fwd(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
@@ -1088,6 +1107,8 @@ def triton_sparse_mla_fwd(
 
     Returns [1, seq, H, d_v] bf16 to match tilelang_sparse_fwd.
     """
+    if (q_rope is None or q_rope.shape[-1] == 0) and torch.version.hip is not None:  # [rocm-kpool-patch-nope]
+        return _rocm_nope_sparse_mla_fwd(q_nope, kv, indices, sm_scale, d_v)
     seq = q_nope.shape[0]
     H = q_nope.shape[1]
     num_cu = _cu_count()

@@ -572,7 +572,8 @@ def topk_from_pooled_history_logits(
             f"is disabled. Got device={logits.device}, dtype={logits.dtype}."
         )
 
-    if group_topk in (128, 160, 192, 224, 256, 512):
+    _rocm = torch.version.hip is not None  # [rocm-kpool-patch]
+    if group_topk in (128, 160, 192, 224, 256, 512) and not _rocm:
         from sglang.kernels.ops.moe.kpool_topk_transform import (
             fast_kpool_topk_transform_fused,
         )
@@ -596,18 +597,38 @@ def topk_from_pooled_history_logits(
         padded[: result.shape[0]] = result
         return padded
 
+    if _rocm and page_table_row_index is not None:  # [rocm-kpool-patch-trim]
+        _need = int(group_lengths.max().item()) * pool_size if group_lengths.numel() else 0
+        if seq_lens is not None and seq_lens.numel():
+            _need = max(_need, int(seq_lens.max().item()))
+        page_table = page_table[:, : max(1, min(_need, page_table.shape[1]))]
+    if _rocm and page_table_row_index is not None:  # [rocm-kpool-patch-rowidx]
+        page_table = page_table.index_select(0, page_table_row_index.to(torch.long))
+        page_table_row_index = None
     assert page_table_row_index is None, (
         "page_table_row_index requires the fused fast_kpool group_topk path"
     )
 
-    from sgl_kernel import fast_topk_v2
+    if _rocm:  # [rocm-kpool-patch]
+        rs = (row_starts.to(torch.long) if row_starts is not None else torch.zeros_like(group_lengths, dtype=torch.long))  # [rocm-kpool-patch-rowstarts]
+        col = torch.arange(cols, device=logits.device)
+        valid = (col[None, :] >= rs[:, None]) & (col[None, :] < rs[:, None] + group_lengths.to(torch.long)[:, None])
+        masked = logits.masked_fill(~valid, float('-inf'))
+        k = min(cols, group_topk)
+        selected_groups = torch.full((logits.shape[0], group_topk), -1, dtype=torch.int32, device=logits.device)
+        if k > 0:
+            _v, _i = torch.topk(masked, k, dim=1, sorted=True)  # [rocm-kpool-patch-invalid]
+            selected_groups[:, :k] = torch.where(torch.isfinite(_v), _i - rs[:, None], -1).to(torch.int32)
+        row_starts = None
+    else:
+        from sgl_kernel import fast_topk_v2
 
-    selected_groups = fast_topk_v2(
-        logits,
-        group_lengths.to(torch.int32),
-        group_topk,
-        row_starts=row_starts,
-    )
+        selected_groups = fast_topk_v2(
+            logits,
+            group_lengths.to(torch.int32),
+            group_topk,
+            row_starts=row_starts,
+        )
 
     rank = torch.arange(group_topk, device=logits.device, dtype=torch.int32)
     max_valid_groups = min(cols, group_topk)

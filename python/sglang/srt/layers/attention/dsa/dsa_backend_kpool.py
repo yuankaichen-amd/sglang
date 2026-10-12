@@ -42,6 +42,7 @@ class DeepseekSparseAttnBackendKPoolMixin:
             topk_indices is None
             or self.dsa_index_kpool <= 1
             or dsa_impl in ("fa3", "tilelang", "trtllm")
+            or (torch.version.hip is not None and dsa_impl == "triton")  # [rocm-kpool-patch-tailbackend]
         ):
             return
         raise NotImplementedError(

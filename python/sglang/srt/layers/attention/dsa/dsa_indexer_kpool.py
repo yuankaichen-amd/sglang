@@ -24,6 +24,60 @@ if is_cuda():
     except ImportError as e:
         deep_gemm = e
 
+if is_hip():  # [rocm-kpool-patch]
+    class _RocmDeepGemmShim:
+        @staticmethod
+        def fp8_mqa_logits(q, kv, weights, ks, ke, clean_logits=True):
+            k_fp8, k_scale = kv
+            k = k_fp8.float() * k_scale.float().view(-1, 1)
+            T, N = q.shape[0], k.shape[0]
+            out = torch.empty((T, N), dtype=torch.float32, device=q.device)
+            cols = torch.arange(N, device=q.device)
+            for s in range(0, T, 1024):
+                e = min(T, s + 1024)
+                score = torch.einsum("thd,nd->thn", q[s:e].float(), k).relu_()
+                logits = torch.einsum("thn,th->tn", score, weights[s:e].float())
+                if clean_logits:
+                    valid = (cols[None, :] >= ks[s:e, None]) & (cols[None, :] < ke[s:e, None])
+                    logits = logits.masked_fill(~valid, float("-inf"))
+                out[s:e] = logits
+            return out
+
+        @staticmethod
+        def get_num_sms():
+            return torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+
+        @staticmethod
+        def get_paged_mqa_logits_metadata(context_lens, block_size, num_sms):
+            return None
+
+        @staticmethod
+        def fp8_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, schedule_metadata, max_len, clean_logits=True):
+            # q [B, next_n, H, D] fp8; kv_cache [P, BLK, 1, D + 4] bytes: per page BLK*D fp8
+            # values followed by BLK fp32 scales (DeepGEMM / SGLang index-K layout).
+            B, next_n, H, D = q.shape
+            P, BLK = kv_cache.shape[0], kv_cache.shape[1]
+            flat = kv_cache.reshape(P, -1).view(torch.uint8)
+            vals = flat[:, : BLK * D].reshape(P, BLK, D).view(q.dtype)
+            scales = flat[:, BLK * D :].contiguous().view(torch.float32)
+            NP = block_table.shape[1]
+            K = min(max_len, NP * BLK)
+            ctx = context_lens.reshape(B, -1)[:, :1].to(torch.long)
+            w = weights.reshape(B, next_n, H).float()
+            out = torch.full((B * next_n, max_len), float("-inf"), dtype=torch.float32, device=q.device)
+            cols = torch.arange(K, device=q.device)
+            for s in range(0, B, 16):
+                e = min(B, s + 16)
+                bt = block_table[s:e].to(torch.long).clamp(min=0)
+                k = (vals[bt].float() * scales[bt].unsqueeze(-1)).reshape(e - s, NP * BLK, D)[:, :K]
+                score = torch.einsum("bnhd,bkd->bnhk", q[s:e].float(), k).relu_()
+                logits = torch.einsum("bnhk,bnh->bnk", score, w[s:e])
+                logits = logits.masked_fill(cols[None, None, :] >= ctx[s:e, :, None], float("-inf"))
+                out[s * next_n : e * next_n, :K] = logits.reshape(-1, K)
+            return out
+
+    deep_gemm = _RocmDeepGemmShim()
+
 if is_npu():
     try:
         import custom_ops  # noqa: F401
@@ -113,7 +167,7 @@ class IndexerKPool(MultiPlatformOp):
         if is_cuda() and self.alt_stream is not None:
             self.compress_gate_stream = torch.cuda.Stream()
 
-        if is_cuda():
+        if is_cuda() or is_hip():  # [rocm-kpool-patch]
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
 
@@ -1536,7 +1590,9 @@ class IndexerKPool(MultiPlatformOp):
         if weights is None:
             weights = self._get_logits_head_gate(x, q_scale)
 
-        if is_cuda():
+        if is_hip() and not (forward_batch.forward_mode.is_extend_without_speculative() or forward_batch.forward_mode.is_decode_or_idle()):  # [rocm-kpool-patch]
+            raise NotImplementedError("ROCm kpool indexer patch supports extend and decode only")
+        if is_cuda() or is_hip():  # [rocm-kpool-patch]
             if (
                 forward_batch.forward_mode.is_decode_or_idle()
                 or forward_batch.forward_mode.is_target_verify()
