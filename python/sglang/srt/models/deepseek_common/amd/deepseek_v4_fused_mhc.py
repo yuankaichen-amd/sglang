@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
+_is_gfx942 = _is_hip and "gfx942" in torch.cuda.get_device_properties(0).gcnArchName
 
 _FUSED_HC_POST_PRE_M_THRESHOLD = 64
 _FUSED_HC_POST_PRE_CACHE: dict[tuple, dict[str, torch.Tensor]] = {}
@@ -33,6 +34,9 @@ def _is_fused_mhc_post_pre_enabled() -> bool:
     # Gate only on SGLANG_OPT_FUSE_MHC_POST_PRE; TileLang switches don't apply.
     if _is_gfx1250_supported:
         return envs.SGLANG_OPT_FUSE_MHC_POST_PRE.get()
+    # gfx942: TileLang's HIP codegen cannot lower the fused kernel (tl.get_lane_idx).
+    if _is_gfx942:
+        return False
     # SM120 disables the standalone TileLang pre path. mhc_fused_post_pre does
     # not read that flag and dispatches independently for both small and large
     # token batches, so the standalone pre flag must not veto the fused opt-in.
@@ -44,7 +48,8 @@ def _is_fused_mhc_post_pre_enabled() -> bool:
 
 
 def _is_aiter_gfx95_mhc_available() -> bool:
-    return _is_hip and get_bool_env_var("SGLANG_USE_AITER") and is_gfx95_supported()
+    # aiter's mHC kernels (including mhc_fused_post_pre) also run on gfx942.
+    return _is_hip and get_bool_env_var("SGLANG_USE_AITER") and (is_gfx95_supported() or _is_gfx942)
 
 
 def _is_production_mhc_enabled() -> bool:

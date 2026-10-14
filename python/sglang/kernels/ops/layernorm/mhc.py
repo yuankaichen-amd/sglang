@@ -33,10 +33,15 @@ _AITER_MHC_RUNTIME_DISABLED = False
 _AITER_MHC_ACTIVE_LOGGED = False
 
 
+def _is_gfx942() -> bool:
+    return _is_hip and "gfx942" in torch.cuda.get_device_properties(0).gcnArchName
+
+
 def _use_aiter_mhc() -> bool:
+    # aiter's mHC kernels also run on gfx942 (MI300X), using their default config for its CU count.
     return (
         not _AITER_MHC_RUNTIME_DISABLED
-        and is_gfx95_supported()
+        and (is_gfx95_supported() or _is_gfx942())
         and envs.SGLANG_USE_AITER.get()
     )
 
@@ -87,7 +92,7 @@ def _try_aiter_mhc_pre(
         return None
 
     if not _AITER_MHC_ACTIVE_LOGGED:
-        logger.info("Using AITER gfx950 mHC pre/post kernels")
+        logger.info("Using AITER mHC pre/post kernels")
         _AITER_MHC_ACTIVE_LOGGED = True
     return result
 
