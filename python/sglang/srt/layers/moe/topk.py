@@ -292,6 +292,10 @@ class TopKConfig:
         if self._correction_bias_cache_key != cache_key:
             self._correction_bias_dtype_cache = correction_bias.to(dtype=dtype)
             self._correction_bias_cache_key = cache_key
+        else:
+            # Writes through `param.data` (RL weight sync, dummy-load warmup) do not bump
+            # _version, so refresh the copy in place; this keeps CUDA-graph addresses stable.
+            self._correction_bias_dtype_cache.copy_(correction_bias)
         return self._correction_bias_dtype_cache
 
 
